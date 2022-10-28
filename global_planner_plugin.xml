@@ -1,0 +1,5 @@
+<library path="nav2_graph_planner">
+	<class name="nav2_graph_planner/GraphPlanner" type="nav2_graph_planner:GraphPlanner" base_class_type="nav2_core::GlobalPlanner">
+	  <description></description>
+	</class>
+</library>

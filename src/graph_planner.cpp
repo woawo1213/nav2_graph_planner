@@ -19,9 +19,8 @@
 // the Global Dynamic Window Approach. IEEE.
 // https://cs.stanford.edu/group/manips/publications/pdfs/Brock_1999_ICRA.pdf
 
-// #define BENCHMARK_TESTING
 
-#include "nav2_graph_planner/navfn_planner.hpp"
+#include "nav2_graph_planner/graph_planner.hpp"
 
 #include <chrono>
 #include <cmath>
@@ -31,12 +30,13 @@
 #include <memory>
 #include <string>
 #include <vector>
+#include <utility>
 
 #include "builtin_interfaces/msg/duration.hpp"
-#include "nav2_graph_planner/navfn.hpp"
 #include "nav2_util/costmap.hpp"
 #include "nav2_util/node_utils.hpp"
 #include "nav2_costmap_2d/cost_values.hpp"
+
 
 using namespace std::chrono_literals;
 using namespace std::chrono;  // NOLINT
@@ -47,28 +47,31 @@ using std::placeholders::_1;
 namespace nav2_graph_planner
 {
 
-NavfnPlanner::NavfnPlanner()
-: tf_(nullptr), costmap_(nullptr)
+
+GraphPlanner::GraphPlanner()
+: tf_(nullptr)
 {
+  // graph_map_table_;
 }
 
-NavfnPlanner::~NavfnPlanner()
+GraphPlanner::~GraphPlanner()
 {
   RCLCPP_INFO(
-    logger_, "Destroying plugin %s of type NavfnPlanner",
+    logger_, "Destroying plugin %s of type GraphPlanner",
     name_.c_str());
 }
 
 void
-NavfnPlanner::configure(
+GraphPlanner::configure(
   const rclcpp_lifecycle::LifecycleNode::WeakPtr & parent,
   std::string name, std::shared_ptr<tf2_ros::Buffer> tf,
   std::shared_ptr<nav2_costmap_2d::Costmap2DROS> costmap_ros)
 {
+  
   tf_ = tf;
   name_ = name;
-  costmap_ = costmap_ros->getCostmap();
-  global_frame_ = costmap_ros->getGlobalFrameID();
+  costmap_ = costmap_ros->getCostmap(); //받지만 사용하진 않음.
+  global_frame_ = costmap_ros->getGlobalFrameID(); // costmap frame id 받아야하나?
 
   node_ = parent;
   auto node = parent.lock();
@@ -76,456 +79,85 @@ NavfnPlanner::configure(
   logger_ = node->get_logger();
 
   RCLCPP_INFO(
-    logger_, "Configuring plugin %s of type NavfnPlanner",
+    logger_, "Configuring plugin %s of type GraphPlanner",
     name_.c_str());
 
   // Initialize parameters
   // Declare this plugin's parameters
   declare_parameter_if_not_declared(node, name + ".tolerance", rclcpp::ParameterValue(0.5));
   node->get_parameter(name + ".tolerance", tolerance_);
-  declare_parameter_if_not_declared(node, name + ".use_astar", rclcpp::ParameterValue(false));
-  node->get_parameter(name + ".use_astar", use_astar_);
   declare_parameter_if_not_declared(node, name + ".allow_unknown", rclcpp::ParameterValue(true));
   node->get_parameter(name + ".allow_unknown", allow_unknown_);
-  declare_parameter_if_not_declared(
-    node, name + ".use_final_approach_orientation", rclcpp::ParameterValue(false));
-  node->get_parameter(name + ".use_final_approach_orientation", use_final_approach_orientation_);
 
-  // Create a planner based on the new costmap size
-  planner_ = std::make_unique<NavFn>(
-    costmap_->getSizeInCellsX(),
-    costmap_->getSizeInCellsY());
+
+  // subscriber declare -> graph_map_server 가 publish 하는  GraphMap.msg 기반으로 map 제작<pose, node_id>
+  graph_map_sub_ = node->create_subscription<graph_map_msgs::msg::GraphMap>(
+    "graph_map",
+    rclcpp::SystemDefaultsQoS(),
+    std::bind(&GraphPlanner::mapReceived, this, std::placeholders::_1)
+  );
 }
 
 void
-NavfnPlanner::activate()
+GraphPlanner::activate()
 {
   RCLCPP_INFO(
-    logger_, "Activating plugin %s of type NavfnPlanner",
+    logger_, "Activating plugin %s of type GraphPlanner",
     name_.c_str());
-  // Add callback for dynamic parameters
   auto node = node_.lock();
   dyn_params_handler_ = node->add_on_set_parameters_callback(
-    std::bind(&NavfnPlanner::dynamicParametersCallback, this, _1));
+    std::bind(&GraphPlanner::dynamicParametersCallback, this, _1));
 }
 
 void
-NavfnPlanner::deactivate()
+GraphPlanner::deactivate()
 {
   RCLCPP_INFO(
-    logger_, "Deactivating plugin %s of type NavfnPlanner",
+    logger_, "Deactivating plugin %s of type GraphPlanner",
     name_.c_str());
   dyn_params_handler_.reset();
 }
 
 void
-NavfnPlanner::cleanup()
+GraphPlanner::cleanup()
 {
   RCLCPP_INFO(
-    logger_, "Cleaning up plugin %s of type NavfnPlanner",
+    logger_, "Cleaning up plugin %s of type GraphPlanner",
     name_.c_str());
-  planner_.reset();
+  graph_map_sub_.reset(); //새로운 맵 들어올경우
+  // planner_.reset();
 }
 
-nav_msgs::msg::Path NavfnPlanner::createPlan(
+nav_msgs::msg::Path GraphPlanner::createPlan(
   const geometry_msgs::msg::PoseStamped & start,
   const geometry_msgs::msg::PoseStamped & goal)
 {
-#ifdef BENCHMARK_TESTING
-  steady_clock::time_point a = steady_clock::now();
-#endif
-
-  // Update planner based on the new costmap size
-  if (isPlannerOutOfDate()) {
-    planner_->setNavArr(
-      costmap_->getSizeInCellsX(),
-      costmap_->getSizeInCellsY());
-  }
-
   nav_msgs::msg::Path path;
 
-  // Corner case of the start(x,y) = goal(x,y)
-  if (start.pose.position.x == goal.pose.position.x &&
-    start.pose.position.y == goal.pose.position.y)
-  {
-    unsigned int mx, my;
-    costmap_->worldToMap(start.pose.position.x, start.pose.position.y, mx, my);
-    if (costmap_->getCost(mx, my) == nav2_costmap_2d::LETHAL_OBSTACLE) {
-      RCLCPP_WARN(logger_, "Failed to create a unique pose path because of obstacles");
-      return path;
-    }
-    path.header.stamp = clock_->now();
-    path.header.frame_id = global_frame_;
-    geometry_msgs::msg::PoseStamped pose;
-    pose.header = path.header;
-    pose.pose.position.z = 0.0;
+  // auto start_time = std::chrono::steady_clock::now();
+  path.header.stamp=clock_->now();
+  path.header.frame_id=global_frame_;
 
-    pose.pose = start.pose;
-    // if we have a different start and goal orientation, set the unique path pose to the goal
-    // orientation, unless use_final_approach_orientation=true where we need it to be the start
-    // orientation to avoid movement from the local planner
-    if (start.pose.orientation != goal.pose.orientation && !use_final_approach_orientation_) {
-      pose.pose.orientation = goal.pose.orientation;
-    }
-    path.poses.push_back(pose);
-    return path;
-  }
+  /*
+    여기다가 path 생성하는 코드 작성
+    지정된 action에 의해서 start goal pose는 정해져있는 값이 들어올꺼임
+    pose 를 이용한 unordered_map 에서 path 만들기 <pose_string, node_id>
+    1. start와 goal 의 string(pose) 주고
+    2. 받은 string(pose) 바탕으로 node id 검색
+    3. node id 바탕으로 dijkstra 돌려
+  */
+  int start_node_id = getNodeId(start);
+  int goal_node_id = getNodeId(goal);
+  
 
-  if (!makePlan(start.pose, goal.pose, tolerance_, path)) {
-    RCLCPP_WARN(
-      logger_, "%s: failed to create plan with "
-      "tolerance %.2f.", name_.c_str(), tolerance_);
-  }
-
-
-#ifdef BENCHMARK_TESTING
-  steady_clock::time_point b = steady_clock::now();
-  duration<double> time_span = duration_cast<duration<double>>(b - a);
-  std::cout << "It took " << time_span.count() * 1000 << std::endl;
-#endif
+  path = calcShortestPath(start_node_id, goal_node_id);
 
   return path;
 }
 
-bool
-NavfnPlanner::isPlannerOutOfDate()
-{
-  if (!planner_.get() ||
-    planner_->nx != static_cast<int>(costmap_->getSizeInCellsX()) ||
-    planner_->ny != static_cast<int>(costmap_->getSizeInCellsY()))
-  {
-    return true;
-  }
-  return false;
-}
-
-bool
-NavfnPlanner::makePlan(
-  const geometry_msgs::msg::Pose & start,
-  const geometry_msgs::msg::Pose & goal, double tolerance,
-  nav_msgs::msg::Path & plan)
-{
-  // clear the plan, just in case
-  plan.poses.clear();
-
-  plan.header.stamp = clock_->now();
-  plan.header.frame_id = global_frame_;
-
-  // TODO(orduno): add checks for start and goal reference frame -- should be in global frame
-
-  double wx = start.position.x;
-  double wy = start.position.y;
-
-  RCLCPP_DEBUG(
-    logger_, "Making plan from (%.2f,%.2f) to (%.2f,%.2f)",
-    start.position.x, start.position.y, goal.position.x, goal.position.y);
-
-  unsigned int mx, my;
-  if (!worldToMap(wx, wy, mx, my)) {
-    RCLCPP_WARN(
-      logger_,
-      "Cannot create a plan: the robot's start position is off the global"
-      " costmap. Planning will always fail, are you sure"
-      " the robot has been properly localized?");
-    return false;
-  }
-
-  // clear the starting cell within the costmap because we know it can't be an obstacle
-  clearRobotCell(mx, my);
-
-  std::unique_lock<nav2_costmap_2d::Costmap2D::mutex_t> lock(*(costmap_->getMutex()));
-
-  // make sure to resize the underlying array that Navfn uses
-  planner_->setNavArr(
-    costmap_->getSizeInCellsX(),
-    costmap_->getSizeInCellsY());
-
-  planner_->setCostmap(costmap_->getCharMap(), true, allow_unknown_);
-
-  lock.unlock();
-
-  int map_start[2];
-  map_start[0] = mx;
-  map_start[1] = my;
-
-  wx = goal.position.x;
-  wy = goal.position.y;
-
-  if (!worldToMap(wx, wy, mx, my)) {
-    RCLCPP_WARN(
-      logger_,
-      "The goal sent to the planner is off the global costmap."
-      " Planning will always fail to this goal.");
-    return false;
-  }
-
-  int map_goal[2];
-  map_goal[0] = mx;
-  map_goal[1] = my;
-
-  // TODO(orduno): Explain why we are providing 'map_goal' to setStart().
-  //               Same for setGoal, seems reversed. Computing backwards?
-
-  planner_->setStart(map_goal);
-  planner_->setGoal(map_start);
-  if (use_astar_) {
-    planner_->calcNavFnAstar();
-  } else {
-    planner_->calcNavFnDijkstra(true);
-  }
-
-  double resolution = costmap_->getResolution();
-  geometry_msgs::msg::Pose p, best_pose;
-
-  bool found_legal = false;
-
-  p = goal;
-  double potential = getPointPotential(p.position);
-  if (potential < POT_HIGH) {
-    // Goal is reachable by itself
-    best_pose = p;
-    found_legal = true;
-  } else {
-    // Goal is not reachable. Trying to find nearest to the goal
-    // reachable point within its tolerance region
-    double best_sdist = std::numeric_limits<double>::max();
-
-    p.position.y = goal.position.y - tolerance;
-    while (p.position.y <= goal.position.y + tolerance) {
-      p.position.x = goal.position.x - tolerance;
-      while (p.position.x <= goal.position.x + tolerance) {
-        potential = getPointPotential(p.position);
-        double sdist = squared_distance(p, goal);
-        if (potential < POT_HIGH && sdist < best_sdist) {
-          best_sdist = sdist;
-          best_pose = p;
-          found_legal = true;
-        }
-        p.position.x += resolution;
-      }
-      p.position.y += resolution;
-    }
-  }
-
-  if (found_legal) {
-    // extract the plan
-    if (getPlanFromPotential(best_pose, plan)) {
-      smoothApproachToGoal(best_pose, plan);
-
-      // If use_final_approach_orientation=true, interpolate the last pose orientation from the
-      // previous pose to set the orientation to the 'final approach' orientation of the robot so
-      // it does not rotate.
-      // And deal with corner case of plan of length 1
-      if (use_final_approach_orientation_) {
-        size_t plan_size = plan.poses.size();
-        if (plan_size == 1) {
-          plan.poses.back().pose.orientation = start.orientation;
-        } else if (plan_size > 1) {
-          double dx, dy, theta;
-          auto last_pose = plan.poses.back().pose.position;
-          auto approach_pose = plan.poses[plan_size - 2].pose.position;
-          // Deal with the case of NavFn producing a path with two equal last poses
-          if (std::abs(last_pose.x - approach_pose.x) < 0.0001 &&
-            std::abs(last_pose.y - approach_pose.y) < 0.0001 && plan_size > 2)
-          {
-            approach_pose = plan.poses[plan_size - 3].pose.position;
-          }
-          dx = last_pose.x - approach_pose.x;
-          dy = last_pose.y - approach_pose.y;
-          theta = atan2(dy, dx);
-          plan.poses.back().pose.orientation =
-            nav2_util::geometry_utils::orientationAroundZAxis(theta);
-        }
-      }
-    } else {
-      RCLCPP_ERROR(
-        logger_,
-        "Failed to create a plan from potential when a legal"
-        " potential was found. This shouldn't happen.");
-    }
-  }
-
-  return !plan.poses.empty();
-}
-
-void
-NavfnPlanner::smoothApproachToGoal(
-  const geometry_msgs::msg::Pose & goal,
-  nav_msgs::msg::Path & plan)
-{
-  // Replace the last pose of the computed path if it's actually further away
-  // to the second to last pose than the goal pose.
-  if (plan.poses.size() >= 2) {
-    auto second_to_last_pose = plan.poses.end()[-2];
-    auto last_pose = plan.poses.back();
-    if (
-      squared_distance(last_pose.pose, second_to_last_pose.pose) >
-      squared_distance(goal, second_to_last_pose.pose))
-    {
-      plan.poses.back().pose = goal;
-      return;
-    }
-  }
-  geometry_msgs::msg::PoseStamped goal_copy;
-  goal_copy.pose = goal;
-  plan.poses.push_back(goal_copy);
-}
-
-bool
-NavfnPlanner::getPlanFromPotential(
-  const geometry_msgs::msg::Pose & goal,
-  nav_msgs::msg::Path & plan)
-{
-  // clear the plan, just in case
-  plan.poses.clear();
-
-  // Goal should be in global frame
-  double wx = goal.position.x;
-  double wy = goal.position.y;
-
-  // the potential has already been computed, so we won't update our copy of the costmap
-  unsigned int mx, my;
-  if (!worldToMap(wx, wy, mx, my)) {
-    RCLCPP_WARN(
-      logger_,
-      "The goal sent to the navfn planner is off the global costmap."
-      " Planning will always fail to this goal.");
-    return false;
-  }
-
-  int map_goal[2];
-  map_goal[0] = mx;
-  map_goal[1] = my;
-
-  planner_->setStart(map_goal);
-
-  const int & max_cycles = (costmap_->getSizeInCellsX() >= costmap_->getSizeInCellsY()) ?
-    (costmap_->getSizeInCellsX() * 4) : (costmap_->getSizeInCellsY() * 4);
-
-  int path_len = planner_->calcPath(max_cycles);
-  if (path_len == 0) {
-    return false;
-  }
-
-  auto cost = planner_->getLastPathCost();
-  RCLCPP_DEBUG(
-    logger_,
-    "Path found, %d steps, %f cost\n", path_len, cost);
-
-  // extract the plan
-  float * x = planner_->getPathX();
-  float * y = planner_->getPathY();
-  int len = planner_->getPathLen();
-
-  for (int i = len - 1; i >= 0; --i) {
-    // convert the plan to world coordinates
-    double world_x, world_y;
-    mapToWorld(x[i], y[i], world_x, world_y);
-
-    geometry_msgs::msg::PoseStamped pose;
-    pose.pose.position.x = world_x;
-    pose.pose.position.y = world_y;
-    pose.pose.position.z = 0.0;
-    pose.pose.orientation.x = 0.0;
-    pose.pose.orientation.y = 0.0;
-    pose.pose.orientation.z = 0.0;
-    pose.pose.orientation.w = 1.0;
-    plan.poses.push_back(pose);
-  }
-
-  return !plan.poses.empty();
-}
-
-double
-NavfnPlanner::getPointPotential(const geometry_msgs::msg::Point & world_point)
-{
-  unsigned int mx, my;
-  if (!worldToMap(world_point.x, world_point.y, mx, my)) {
-    return std::numeric_limits<double>::max();
-  }
-
-  unsigned int index = my * planner_->nx + mx;
-  return planner_->potarr[index];
-}
-
-// bool
-// NavfnPlanner::validPointPotential(const geometry_msgs::msg::Point & world_point)
-// {
-//   return validPointPotential(world_point, tolerance_);
-// }
-
-// bool
-// NavfnPlanner::validPointPotential(
-//   const geometry_msgs::msg::Point & world_point, double tolerance)
-// {
-//   const double resolution = costmap_->getResolution();
-
-//   geometry_msgs::msg::Point p = world_point;
-//   double potential = getPointPotential(p);
-//   if (potential < POT_HIGH) {
-//     // world_point is reachable by itself
-//     return true;
-//   } else {
-//     // world_point, is not reachable. Trying to find any
-//     // reachable point within its tolerance region
-//     p.y = world_point.y - tolerance;
-//     while (p.y <= world_point.y + tolerance) {
-//       p.x = world_point.x - tolerance;
-//       while (p.x <= world_point.x + tolerance) {
-//         potential = getPointPotential(p);
-//         if (potential < POT_HIGH) {
-//           return true;
-//         }
-//         p.x += resolution;
-//       }
-//       p.y += resolution;
-//     }
-//   }
-
-//   return false;
-// }
-
-bool
-NavfnPlanner::worldToMap(double wx, double wy, unsigned int & mx, unsigned int & my)
-{
-  if (wx < costmap_->getOriginX() || wy < costmap_->getOriginY()) {
-    return false;
-  }
-
-  mx = static_cast<int>(
-    std::round((wx - costmap_->getOriginX()) / costmap_->getResolution()));
-  my = static_cast<int>(
-    std::round((wy - costmap_->getOriginY()) / costmap_->getResolution()));
-
-  if (mx < costmap_->getSizeInCellsX() && my < costmap_->getSizeInCellsY()) {
-    return true;
-  }
-
-  RCLCPP_ERROR(
-    logger_,
-    "worldToMap failed: mx,my: %d,%d, size_x,size_y: %d,%d", mx, my,
-    costmap_->getSizeInCellsX(), costmap_->getSizeInCellsY());
-
-  return false;
-}
-
-void
-NavfnPlanner::mapToWorld(double mx, double my, double & wx, double & wy)
-{
-  wx = costmap_->getOriginX() + mx * costmap_->getResolution();
-  wy = costmap_->getOriginY() + my * costmap_->getResolution();
-}
-
-void
-NavfnPlanner::clearRobotCell(unsigned int mx, unsigned int my)
-{
-  // TODO(orduno): check usage of this function, might instead be a request to
-  //               world_model / map server
-  costmap_->setCost(mx, my, nav2_costmap_2d::FREE_SPACE);
-}
 
 rcl_interfaces::msg::SetParametersResult
-NavfnPlanner::dynamicParametersCallback(std::vector<rclcpp::Parameter> parameters)
+GraphPlanner::dynamicParametersCallback(std::vector<rclcpp::Parameter> parameters)
 {
   rcl_interfaces::msg::SetParametersResult result;
   for (auto parameter : parameters) {
@@ -537,20 +169,187 @@ NavfnPlanner::dynamicParametersCallback(std::vector<rclcpp::Parameter> parameter
         tolerance_ = parameter.as_double();
       }
     } else if (type == ParameterType::PARAMETER_BOOL) {
-      if (name == name_ + ".use_astar") {
-        use_astar_ = parameter.as_bool();
-      } else if (name == name_ + ".allow_unknown") {
+      if (name == name_ + ".allow_unknown") {
         allow_unknown_ = parameter.as_bool();
-      } else if (name == name_ + ".use_final_approach_orientation") {
-        use_final_approach_orientation_ = parameter.as_bool();
-      }
+      } 
     }
   }
   result.successful = true;
   return result;
 }
 
+std::map<std::string, int>
+GraphPlanner::createGraphNodeTable(const graph_map_msgs::msg::GraphMap &msg) {
+  std::map<std::string, int> table_;
+
+  for (auto &node : msg.nodes) {
+
+    std::string pos_x = std::to_string(node.pose.position.x);
+    std::string pos_y = std::to_string(node.pose.position.y);
+    std::string pos_z = std::to_string(node.pose.position.z);
+    std::string orientaion_x = std::to_string(node.pose.orientation.x);
+    std::string orientaion_y = std::to_string(node.pose.orientation.y);
+    std::string orientaion_z = std::to_string(node.pose.orientation.z);
+    std::string orientaion_w = std::to_string(node.pose.orientation.w);
+
+    std::string key = pos_x + pos_y + pos_z + orientaion_x + orientaion_y +
+                      orientaion_z + orientaion_w;
+
+    table_.insert(std::pair<std::string, int>(key, node.id));
+  }
+  return table_;
+}
+
+std::vector<std::pair<int,int>>
+GraphPlanner::createGraphEdgeTable(const graph_map_msgs::msg::GraphMap &msg){
+  std::vector<std::pair<int,int>> table_;
+
+  for(auto &edge :msg.edges){
+    table_.push_back({edge.id_0,edge.id_1});
+  }
+  return table_;
+}
+
+
+
+
+void GraphPlanner::mapReceived(const graph_map_msgs::msg::GraphMap &msg) {
+  // 넘겨줘서 맵만들기
+  RCLCPP_DEBUG(rclcpp::get_logger("rclcpp"), "GraphPlannerNode: A new graph map was received.");
+  graph_node_table_ = createGraphNodeTable(msg);
+  graph_edge_table_ = createGraphEdgeTable(msg);
+}
+
+int GraphPlanner::getNodeId(const geometry_msgs::msg::PoseStamped &msg) {
+  int value_;
+
+  std::string spos_x = std::to_string(msg.pose.position.x);
+  std::string spos_y = std::to_string(msg.pose.position.y);
+  std::string spos_z = std::to_string(msg.pose.position.z);
+  std::string sorientaion_x = std::to_string(msg.pose.orientation.x);
+  std::string sorientaion_y = std::to_string(msg.pose.orientation.y);
+  std::string sorientaion_z = std::to_string(msg.pose.orientation.z);
+  std::string sorientaion_w = std::to_string(msg.pose.orientation.w);
+
+  std::string key = spos_x + spos_y + spos_z + sorientaion_x + sorientaion_y + sorientaion_z + sorientaion_w;
+
+  value_ = graph_node_table_[key];
+
+  return value_;
+}
+
+nav_msgs::msg::Path GraphPlanner::calcShortestPath(int start_node_id, int goal_node_id){
+  nav_msgs::msg::Path shortest_path_;
+  std::string start_pose;
+  std::string goal_pose;
+  std::vector<std::pair<double,double>> node_pos;
+
+
+
+  // make node positon vector
+  // find key form map value
+  // http://devlab.neonkid.xyz/2019/08/09/c++/2019-08-09-C-Map/
+  for(auto it=graph_node_table_.begin();it!=graph_node_table_.end();++it){
+    // it->second  (int)node_id
+    // it->first   (string)pose
+    start_node_id++;
+    goal_node_id++;
+
+    std::string pos_x = it->first.substr(0,6); // first node x position from pose string
+    std::string pos_y = it->first.substr(6,12); // first node y positin from pose string
+
+    node_pos.push_back({std::stof(pos_x),std::stof(pos_y)});
+  }
+
+  /*
+  node_pos 에 각 노드의 position(x,y)의 vector가 있음
+  --------------------------------------------------
+  https://www.javatpoint.com/cpp-dijkstra-algorithm-using-priority-queue
+  1. 연결된 노드 사이에거리
+  dijstra돌릴때 
+  */
+  int node_count = graph_node_table_.size();
+  std::vector<Pair_> node_adj[100];
+
+  //addEdge
+  for (auto it=graph_edge_table_.begin();it!=graph_edge_table_.end();it++){
+    int s = it -> first;
+    int e = it -> second;
+
+    // get 2 pos dist
+    // http://wiki.ros.org/tf2_eigen
+    // geometry_msgs/PointStamped tf2::Stamped<Eigen::Vector3d>  Eigen::Vector3d v(x,y,z)
+    Eigen::Vector3d sv(node_pos[s].first, node_pos[s].second, 0);
+    Eigen::Vector3d ev(node_pos[e].first, node_pos[e].second, 0);
+
+    double dist = (sv - ev).norm();
+
+    node_adj[s].push_back({e,dist});
+  }
+
+  //Dijstra Alogorithm
+  std::priority_queue<Pair_, std::vector<Pair_>, std::greater<Pair_>> pq;
+
+  const double INF = std::numeric_limits<double>::infinity();
+
+  std::vector<double> dist(node_count, INF);
+  int arr[1001];
+  pq.push({0, start_node_id});
+  dist[start_node_id] = 0;
+
+  while (!pq.empty()) {
+    int u = pq.top().second;
+    pq.pop();
+
+    for (auto x : node_adj[u]) {
+      int v = x.first;
+      int weight = x.second;
+
+      if (dist[v] > dist[u] + weight) {
+        arr[v]=u;
+        dist[v] = dist[u] + weight;
+        pq.push({dist[v], v});
+      }
+    }
+  }
+
+
+  //push node path
+  std::vector<int> nodeSeq;
+  int temp = goal_node_id;
+  while(temp){
+    nodeSeq.push_back(temp);
+    temp=arr[temp];
+  }
+
+  //nodeSeq 가 src 에서 goal 까지의 node들의 순서를 가짐.
+
+  geometry_msgs::msg::PoseStamped pose;
+  //nodeSeq -> shortest_path_
+  for (auto node : nodeSeq) {
+    for (auto it = graph_node_table_.begin(); it != graph_node_table_.end(); ++it) {
+      if (node == it->second) {
+        std::string pos_x = it->first.substr(0, 6); // first node x position from pose string
+        std::string pos_y = it->first.substr(6, 12); // first node y positin from pose string
+        // position of x   std::stof(pos_x)
+        // position of y   std::stof(pos_y)
+        pose.header.stamp=clock_->now();
+        pose.pose.position.x = std::stof(pos_x);
+        pose.pose.position.y = std::stof(pos_y);
+        pose.pose.position.z = 0.0;
+        pose.pose.orientation.x = 0.0;
+        pose.pose.orientation.y = 0.0;
+        pose.pose.orientation.z = 0.0;
+        pose.pose.orientation.w = 1.0;
+      }
+    }
+  }
+  shortest_path_.poses.push_back(pose);
+
+  return shortest_path_;
+}
+
 }  // namespace nav2_graph_planner
 
 #include "pluginlib/class_list_macros.hpp"
-PLUGINLIB_EXPORT_CLASS(nav2_graph_planner::NavfnPlanner, nav2_core::GlobalPlanner)
+PLUGINLIB_EXPORT_CLASS(nav2_graph_planner::GraphPlanner, nav2_core::GlobalPlanner)
